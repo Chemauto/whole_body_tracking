@@ -24,6 +24,20 @@
     --input_fps 30 --output_name dance1_subject1 --output_dir ./motions --headless
   ```
 
+### [`scripts/asap_to_csv.py`](scripts/asap_to_csv.py)
+**作用**：把 **ASAP (HumanoidVerse)** 重定向后的 `.pkl` 动作（23 自由度 G1）转成本项目要的 36 列
+csv，作为 `csv_to_npz.py` 的输入。自动按名字映射 23→29 自由度（缺的 6 个手腕关节填 0），
+四元数 (x,y,z,w) 直通。用于接入 ASAP 仓库里的 CR7 / Kobe / Bolt / Lebron / walk / kick 等动作。
+- 关键参数：`--pkl`（ASAP pkl 路径）、`--output_name`、`--output_dir`、`--start`/`--end`。
+- 示例（转 CR7，再转 npz）：
+  ```bash
+  python scripts/asap_to_csv.py \
+    --pkl /data/rl_robot/ASAP/humanoidverse/data/motions/g1_29dof_anneal_23dof/TairanTestbed/singles/0-TairanTestbed_TairanTestbed_CR7_video_CR7_level1_filter_amass.pkl \
+    --output_name cr7_celebration --output_dir ./motions
+  python scripts/csv_to_npz.py --input_file ./motions/cr7_celebration.csv \
+    --input_fps 30 --output_name cr7_celebration --output_dir ./motions --headless
+  ```
+
 ### [`scripts/replay_npz.py`](scripts/replay_npz.py)
 **作用**：在 Isaac Sim 中回放已转换的 `.npz` 动作（驱动机器人按参考动作运动），
 用于在仿真器里肉眼验证转换结果。需要启动 Isaac Sim。
