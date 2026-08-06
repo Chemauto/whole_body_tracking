@@ -1,9 +1,9 @@
-"""This script demonstrates how to use the interactive scene interface to setup a scene with multiple prims.
+"""This script replays a converted motion (npz) in Isaac Sim.
 
 .. code-block:: bash
 
     # Usage
-    python replay_motion.py --motion_file source/whole_body_tracking/whole_body_tracking/assets/g1/motions/lafan_walk_short.npz
+    python replay_npz.py --motion_file ./motions/dance1_subject2.npz
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -16,7 +16,7 @@ from isaaclab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay converted motions.")
-parser.add_argument("--registry_name", type=str, required=True, help="The name of the wand registry.")
+parser.add_argument("--motion_file", type=str, required=True, help="Path to the motion npz file.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -67,16 +67,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
 
-    registry_name = args_cli.registry_name
-    if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
-        registry_name += ":latest"
-    import pathlib
-
-    import wandb
-
-    api = wandb.Api()
-    artifact = api.artifact(registry_name)
-    motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
+    motion_file = args_cli.motion_file
+    print(f"[INFO]: Replaying motion from: {motion_file}")
 
     motion = MotionLoader(
         motion_file,
