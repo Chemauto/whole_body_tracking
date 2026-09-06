@@ -2,7 +2,12 @@ import os
 
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner
 
-from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+from whole_body_tracking.utils.exporter import (
+    attach_onnx_metadata,
+    export_motion_policy_as_onnx,
+    resolve_policy_module,
+    resolve_policy_normalizer,
+)
 
 
 class MotionOnPolicyRunner(OnPolicyRunner):
@@ -18,8 +23,10 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         super().save(path, infos)
         policy_path = path.split("model")[0]
         filename = policy_path.split("/")[-2] + ".onnx"
+        policy = resolve_policy_module(self.alg)
+        normalizer = resolve_policy_normalizer(self.alg)
         export_motion_policy_as_onnx(
-            self.env.unwrapped, self.alg.policy, normalizer=self.obs_normalizer, path=policy_path, filename=filename
+            self.env.unwrapped, policy, normalizer=normalizer, path=policy_path, filename=filename
         )
         run_label = os.path.basename(os.path.normpath(self.log_dir)) if self.log_dir else "local"
         attach_onnx_metadata(self.env.unwrapped, run_label, path=policy_path, filename=filename)

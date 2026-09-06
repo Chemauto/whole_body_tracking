@@ -28,6 +28,33 @@ def export_motion_policy_as_onnx(
     policy_exporter.export(path, filename)
 
 
+def resolve_policy_module(policy_like: object) -> torch.nn.Module:
+    """Return the policy module used for deterministic inference/export."""
+    if hasattr(policy_like, "get_policy") and callable(policy_like.get_policy):
+        return resolve_policy_module(policy_like.get_policy())
+    for attr_name in ("policy", "actor"):
+        module = getattr(policy_like, attr_name, None)
+        if isinstance(module, torch.nn.Module):
+            return module
+    if isinstance(policy_like, torch.nn.Module):
+        return policy_like
+    raise TypeError(f"Could not resolve policy module from object of type {type(policy_like).__name__}.")
+
+
+def resolve_policy_normalizer(policy_owner: object) -> object | None:
+    """Return a separate normalizer only when the policy module does not already own one."""
+    policy = resolve_policy_module(policy_owner)
+    if hasattr(policy, "obs_normalizer"):
+        return None
+
+    for holder in (policy_owner, policy):
+        for attr_name in ("normalizer", "actor_obs_normalizer", "obs_normalizer"):
+            normalizer = getattr(holder, attr_name, None)
+            if normalizer is not None and not isinstance(normalizer, torch.nn.Identity):
+                return normalizer
+    return None
+
+
 class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
     def __init__(self, env: ManagerBasedRLEnv, actor_critic, normalizer=None, verbose=False):
         super().__init__(actor_critic, normalizer, verbose)
