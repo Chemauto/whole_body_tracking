@@ -25,6 +25,26 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--motion_file", type=str, required=True, help="Path to the motion npz file.")
+parser.add_argument(
+    "--init_policy_path",
+    type=str,
+    default=None,
+    help=(
+        "Checkpoint to warm-start from when observation channels were appended (e.g. tracking -> "
+        "kick task). Old channels keep their semantics, appended channels start at zero. "
+        "Mutually exclusive with --resume."
+    ),
+)
+parser.add_argument(
+    "--temporal_actor",
+    action="store_true",
+    default=False,
+    help=(
+        "Use the temporal encoder-decoder policy (KickTemporalOnPolicyRunner): the perceived-ball "
+        "history block feeds an MLP encoder whose latent is concatenated to the current obs, and a "
+        "decoder is supervised from privileged ball state. Requires the kick task layout."
+    ),
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -71,6 +91,55 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def load_appended_checkpoint(runner, checkpoint_path: str, env) -> None:
+    """Warm-start a policy whose observation gained channels right after the command term.
+
+    Plain policy layout before and after: ``[command | appended | rest]``. Every old
+    channel is copied in place so transferred weights keep their semantics; the
+    appended channels (ball obs + history) start at zero, i.e. the inherited
+    behaviour is initially exactly the old policy.
+
+    Temporal actor layout: the actor's first layer sees
+    ``[current(...) | latent(64)]`` instead of the raw observation, so
+    ``actor.0.weight`` is mapped explicitly: old command channels -> front,
+    old remaining channels -> after the ball block, ball + latent columns zero.
+    The critic (and every deeper layer) is handled by the generic rule.
+    """
+    payload = torch.load(checkpoint_path, map_location=runner.device)
+    old_state = payload["model_state_dict"]
+    policy = runner.alg.policy
+    new_state = policy.state_dict()
+    prefix = 2 * env.scene["robot"].num_joints  # command term = [joint_pos, joint_vel]
+    ball_dim = getattr(policy, "ball_dim", 5)  # virtual ball obs incl. visibility flag
+
+    with torch.no_grad():
+        for name, old in old_state.items():
+            if name not in new_state:
+                continue
+            new = new_state[name]
+            if name == "actor.0.weight" and hasattr(policy, "hist_start"):
+                # [old_command | old_rest] -> [old_command | 0(ball,latent) | old_rest]
+                current_end = new.shape[1] - policy.latent_dim  # end of the current-obs block
+                new[:, :prefix] = old[:, :prefix]
+                new[:, prefix + ball_dim : current_end] = old[:, prefix:]
+                print(f"[INFO]: channel-aligned {name}: {tuple(old.shape)} -> {tuple(new.shape)} (temporal)")
+            elif new.shape == old.shape:
+                new.copy_(old)
+            elif new.dim() == 2 and new.shape[0] == old.shape[0] and new.shape[1] > old.shape[1]:
+                appended = new.shape[1] - old.shape[1]
+                new[:, :prefix] = old[:, :prefix]
+                new[:, prefix + appended :] = old[:, prefix:]
+                print(f"[INFO]: channel-aligned {name}: {tuple(old.shape)} -> {tuple(new.shape)}")
+            elif new.dim() == 1 and new.shape[0] > old.shape[0]:
+                appended = new.shape[0] - old.shape[0]
+                new[:prefix] = old[:prefix]
+                new[prefix + appended :] = old[prefix:]
+                print(f"[INFO]: channel-aligned {name}: {tuple(old.shape)} -> {tuple(new.shape)}")
+            else:
+                print(f"[INFO]: skipped {name}: {tuple(old.shape)} -> {tuple(new.shape)}")
+    print(f"[INFO]: Warm-started from appended-observation checkpoint: {checkpoint_path}")
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -125,7 +194,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env)
 
     # create runner from rsl-rl
-    runner = OnPolicyRunner(
+    runner_class = OnPolicyRunner
+    if args_cli.temporal_actor:
+        from whole_body_tracking.utils.temporal_kick import KickTemporalOnPolicyRunner
+
+        runner_class = KickTemporalOnPolicyRunner
+    runner = runner_class(
         env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device
     )
     # write git state to logs
@@ -137,6 +211,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+    elif args_cli.init_policy_path is not None:
+        # warm-start from a checkpoint whose observation has fewer channels:
+        # copy every old channel in place, leave appended channels at zero
+        load_appended_checkpoint(runner, args_cli.init_policy_path, env.unwrapped)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
