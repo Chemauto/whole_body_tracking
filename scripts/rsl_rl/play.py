@@ -58,7 +58,11 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import whole_body_tracking.tasks  # noqa: F401
-from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+from whole_body_tracking.utils.exporter import (
+    attach_onnx_metadata,
+    export_motion_policy_as_onnx,
+    resolve_policy_normalizer,
+)
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -116,13 +120,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_motion_policy_as_onnx(
         env.unwrapped,
         ppo_runner.alg.policy,
-        normalizer=ppo_runner.obs_normalizer,
+        normalizer=resolve_policy_normalizer(ppo_runner.alg),
         path=export_model_dir,
         filename="policy.onnx",
     )
     attach_onnx_metadata(env.unwrapped, resume_path, export_model_dir)
-    # reset environment
-    obs, _ = env.get_observations()
+    # reset environment (rsl_rl 3.x: get_observations returns the obs only)
+    obs = env.get_observations()
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
