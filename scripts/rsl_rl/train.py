@@ -31,7 +31,7 @@ parser.add_argument(
     default=None,
     help=(
         "Checkpoint to warm-start from when observation channels were appended (e.g. tracking -> "
-        "kick task). Old channels keep their semantics, appended channels start at zero. "
+        "kick task). Old channels keep their semantics, appended channels keep their init. "
         "Mutually exclusive with --resume."
     ),
 )
@@ -98,8 +98,9 @@ def load_appended_checkpoint(runner, checkpoint_path: str, env) -> None:
 
     Plain policy layout before and after: ``[command | appended | rest]``. Every old
     channel is copied in place so transferred weights keep their semantics; the
-    appended channels (ball obs + history) start at zero, i.e. the inherited
-    behaviour is initially exactly the old policy.
+    appended channels (ball obs + history) keep their random initialization, so
+    the inherited behaviour matches the old policy up to a bounded perturbation
+    from the new columns.
 
     Temporal actor layout: the actor's first layer sees
     ``[current(...) | latent(64)]`` instead of the raw observation, so
@@ -119,7 +120,7 @@ def load_appended_checkpoint(runner, checkpoint_path: str, env) -> None:
             if name not in new_state:
                 continue
             new = new_state[name]
-            if name == "actor.0.weight" and hasattr(policy, "hist_start"):
+            if name == "actor.0.weight" and hasattr(policy, "hist_start") and new.shape[1] > old.shape[1]:
                 # [old_command | old_rest] -> [old_command | 0(ball,latent) | old_rest]
                 current_end = new.shape[1] - policy.latent_dim  # end of the current-obs block
                 new[:, :prefix] = old[:, :prefix]
@@ -206,6 +207,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir
     if agent_cfg.resume:
+        if args_cli.init_policy_path is not None:
+            raise ValueError("--resume and --init_policy_path are mutually exclusive: resume restores the "
+                             "optimizer/iteration and requires identical observation dims, init does a "
+                             "channel-aligned warm start. Pick one.")
         # get path to previous checkpoint
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
@@ -213,7 +218,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.load(resume_path)
     elif args_cli.init_policy_path is not None:
         # warm-start from a checkpoint whose observation has fewer channels:
-        # copy every old channel in place, leave appended channels at zero
+        # copy every old channel in place, appended channels keep their init
         load_appended_checkpoint(runner, args_cli.init_policy_path, env.unwrapped)
 
     # dump the configuration into log-directory

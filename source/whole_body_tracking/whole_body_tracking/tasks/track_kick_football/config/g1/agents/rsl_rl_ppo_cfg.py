@@ -8,8 +8,12 @@ class G1KickFlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 30000
     save_interval = 500
     experiment_name = "g1_kick"
-    empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
+        # empirical_normalization is a silent no-op on rsl_rl 3.1.2 (the deprecated
+        # shim skips the mapping when the field defaults to MISSING): set it
+        # explicitly or the policy trains on raw observations
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
         init_noise_std=1.0,
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],

@@ -109,7 +109,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+    try:
+        ppo_runner.load(resume_path)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load '{resume_path}'. If this is a --temporal_actor checkpoint "
+            f"(contains hist_encoder/decoder keys), play.py does not support it yet; "
+            f"plain checkpoints load fine. Original error: {exc}"
+        ) from exc
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)

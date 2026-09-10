@@ -48,7 +48,10 @@ $$\epsilon \gtrsim \sigma_{\mathrm{aim}} \quad\text{（容差 ≥ 踢球方向�
    贴参考 = 永远直线踢 = 方位角命中率天花板 33%。策略必须**偏离参考**才能拿到
    GOAL 奖励，此时 MOTION 奖励是纯粹的对抗力；
 3. 但 MOTION 不能在训练一开始就归零——策略还没有任何运动能力，会退化为乱动。
-   因此采用**逐步退火**：`KICK_MOTION_WEIGHT` 从 0.2 起步、随训练压到 0。
+   因此采用**逐步退火**：`KICK_MOTION_WEIGHT` 从 1.0（满权重）起步——先保住动作质量让
+   GOAL 奖励在可用的跟踪基础上长出踢球行为，等 `ball_kick_alignment` 稳定、球速进入
+   4–5 m/s 带后再依次压 0.5 → 0.2 → 0（一步压 0.2 会让 entropy 推高动作 std、跟踪
+   时序漂移、episode 在触球帧之前被终止，实测验证过这个死循环）。
 
 实现上不需要改任何代码：`RewardsCfg.__post_init__` 读取环境变量做组缩放
 （见 §4），阶段切换只是一行 shell 前缀。
@@ -67,10 +70,15 @@ $$\epsilon \gtrsim \sigma_{\mathrm{aim}} \quad\text{（容差 ≥ 踢球方向�
 | 站立段 | frame 0–190 |
 | 上步 | frame ~230（右脚 y 0→0.45） |
 | **摆腿踢球** | frame 244–278，右脚前进速度峰值 **6.6 m/s**，y 从 0.43 冲到 1.63 |
-| 参考触球帧 | **frame 265**（右脚 z≈0.11 ≈ 球心高度，y≈0.85） |
+| 参考触球帧 | **frame 265**（右脚 z≈0.11 ≈ 球心高度，y≈1.05） |
 | 球标准摆位 | `[0.25, 1.2, 0.12]`（RoboNaldo 实测值，动作世界系） |
 
 `kick_step=265` 写入 G1 config，用于 contact 奖励的时间窗门控。
+
+**裁减版**（阶段二实际使用）：`scripts/trim_npz.py` 切片 `[170:510)` 得到
+`right_kick_trimmed.npz`（340 帧 / 6.8 s）——去掉前 3.8 s 与后 2.6 s 的纯站立，
+`kick_step=95`（265−170），episode 6.0 s。世界坐标不变（球摆位无需调整）；
+踢球事件密度约 1.67×（6.0 s vs 10.0 s episode）。完整版仅用于阶段一先验。
 
 ### 2.2 场景加球（`kick_env_cfg.py` · `MySceneCfg`）
 
@@ -148,32 +156,43 @@ _progress_delta     = _progress - 上一步的 _progress
 
 ### 4.1 观测追加（`kick_env_cfg.py` · `ObservationsCfg`）
 
-**硬规则：只追加、不替换、不重排。** `ball_state`（4 维）紧插在 `command` 之后：
+**硬规则：只追加、不替换、不重排。** 球观测块紧插在 `command` 之后：
 
 ```text
-actor:  [command(58) | ball_state(4) | motion_anchor_pos_b(3) | ... ]   160 → 164
-critic: [command(58) | ball_state(4) | ball_velocity(2) | ... ]        286 → 292
+actor:  [command(58) | ball_state_virtual(5) | ball_history(50×5) | 其余(102)]   160 → 415
+critic: [command(58) | ball_state真值(4) | ball_velocity(2) | 其余]              286 → 292
 ```
 
-- `ball_state = [ball_xy(2), unit(球→靶)(2)]`：不加 z（球始终在地面）；
+（虚拟感知的噪声/频率/延迟/丢检建模见 §8.1；时序 encoder-decoder 变体见 §8.3，
+其中 actor 首层输入为 current(165)+latent(64)=229。）
+
+- actor 的 `ball_state_virtual = [估计位置xy(2), 球→靶方向xy(2), 可见flag(1)]`：不加 z
+  （球始终在地面），值来自 §8.1 的虚拟感知（噪声/25 Hz/延迟/丢检）；
+- `ball_history`（50×5）是上述估计的 1 s 时间序列（最旧在前），供 MLP 或 §8.3 的
+  时序 encoder 消费；
 - `ball_velocity`（2 维）**只给 critic**：球被踢前静止，对 actor 无决策信息量且
   真机上难估计；对 critic，踢出后的球速直接决定后续回报（信息价值不对称）；
+- critic 的球通道是**真值**（`ball_state_b` 4 维 + `ball_velocity_b` 2 维），只在
+  PrivilegedCfg 注册——非对称 actor-critic；
 - 通道顺序固定是权重迁移（§5）的前提：插入位置变了，旧权重的通道语义就错位，
   loss 照样下降但每个通道的含义已经错了。
 
-### 4.2 GOAL 奖励组（`mdp/rewards.py` 追加 3 项）
+### 4.2 GOAL 奖励组（`mdp/rewards.py`，6 项）
 
-| 项 | 形式 | 防 exploit 设计 |
+| 项 | 形式 | 设计意图 / 防 exploit |
 |---|---|---|
-| `ball_target_progress` | `_progress_delta`（米/步），权重 4.0 | 对历史最近距离取差 + clamp≥0：**完美射门的过冲不倒扣**（抵达付一次钱，滚过头免费） |
-| `foot_ball_contact` | 稀疏 0/1，权重 1.0 | 几何接近判定（右脚-球距 < 0.22 m）；每局最多 `paid_steps=3` 次计费；仅在 `time_steps ≤ kick_step+100` 窗口内——防"贴球蹭分" |
-| `ball_speed` | `(v−2.5).clamp(0)`，权重 0.2 | 阈值 2.5 m/s：球必须真的被踢动（阈值过低则轻碰也得分） |
+| `ball_target_progress` | `_progress_delta`（米/步），权重 50（整局满 1.0×2.5m=2.5，对齐论文量级） | 对历史最近距离取差 + clamp≥0：**完美射门的过冲不倒扣**（抵达付一次钱，滚过头免费） |
+| `foot_ball_contact` | 稀疏 0/1，权重 10（3 次共 0.6，前期引导信号） | 几何接近判定（右脚-球距 < 0.22 m）；每局最多 `paid_steps=3` 次计费；仅在触球窗口内——防"贴球蹭分" |
+| `ball_kick_alignment` | **一次性事件制**：球速上穿 1 m/s 的瞬间付 `exp(−(夹角/15°)²)`，权重 2.5 | **显式方向对齐**：出射方向 vs 球→靶方向，压 σ_aim。必须事件制——逐步计费会让慢滚（更多步超阈值）比标准射门挣得多，与速度带目标相反 |
+| `ball_speed` | 区间核：<1 零分，1→4.5 线性爬升，>4.5 高斯衰减(σ=1.5)，权重 0.5 | **速度带控制**：踢了就有分、4–5 m/s 满分、8 m/s 猛抽只值 0.004——参考摆腿物理上能给 6+ m/s，无上界奖励会诱导失控大力抽射 |
+| `ball_approach` | 有符号势场差分（robot→球距离逐帧下降），权重 10；**球速>0.5 后冻结** | **保持逼近**：走过头（远离球）倒扣——治理"球落到机器人身后"的失效模式；全局锚点误差在 MOTION 退火后可达 ±0.3 m，没有这项机器人可能游走过球 |
+| `stagnation` | 停滞时 −1，权重 −1.0 | anchor 1 s 位移 < 5 cm 即触发，防站桩 |
 
 ### 4.3 奖励分组与全局缩放（`RewardsCfg.__post_init__`）
 
 ```text
 MOTION 组（6 项跟踪）   × KICK_MOTION_WEIGHT   阶段二压低 → 0
-GOAL   组（3 项球/靶）  × KICK_GOAL_WEIGHT     阶段二打开
+GOAL   组（6 项球/靶）  × KICK_GOAL_WEIGHT     阶段二打开
 REG    组（3 项正则）   × KICK_REG_WEIGHT      保持
 ```
 
@@ -189,40 +208,45 @@ REG    组（3 项正则）   × KICK_REG_WEIGHT      保持
 
 ## 5. 权重迁移（`scripts/rsl_rl/train.py` · `--init_policy_path`）
 
-阶段一 checkpoint 的 actor 首层是 `Linear(160→512)`，阶段二网络是 `Linear(164→512)`，
-直接 `load_state_dict` 会维度不匹配；`--resume` 也要求完全一致。因此新增通道对齐迁移：
+阶段一 checkpoint 的 actor 首层是 `Linear(160→512)`，阶段二是 `Linear(415→512)`
+（temporal 变体为 229），直接 `load_state_dict` 会维度不匹配；`--resume` 也要求完全
+一致（两者互斥，train.py 显式拒绝同给）。通道对齐迁移规则：
 
 ```python
-prefix = 2 × num_joints          # = 58，command 项的维度（由 DoF 推导，不写魔数）
+prefix = 2 × num_joints          # = 58，command 项维度（由 DoF 推导，不写魔数）
+appended = new_dim − old_dim     # plain: 255 = ball(5)+history(250)
 
-new[:, :58]        = old[:, :58]      # command 通道原位
-new[:, 62:]        = old[:, 58:]      # 其余旧通道整体后移 4，语义不变
-new[:, 58:62]                     # ball 4 维保持零初始化
+new[:, :58]              = old[:, :58]     # command 通道原位
+new[:, 58:58+appended]                     # 球+历史列保持随机初始化
+new[:, 58+appended:]     = old[:, 58:]     # 其余旧通道整体后移，语义不变
 ```
 
-- 对所有 2D 权重（actor/critic 首层）按此规则搬移；bias 与深层权重维度不变、直接拷贝；
-- **normalizer 不迁移**：rsl_rl 3.1.2 的 `policy.state_dict()` 不含 normalizer（非持久
-  模块），新运行的统计量从零重新估计。这实际上**规避了参考文档记录的"冻结
-  normalizer / 新通道裸奔"隐患**——无需 fade-in 缓解；
-- 零初始化 ball 列的含义：迁移完成的一瞬间，新策略的输出与旧策略**完全相同**
-  （ball 通道乘零权重），跟踪能力无损继承，之后由 GOAL 奖励逐步塑造。
-
-与 `--resume` 互斥：resume 恢复迭代计数与优化器状态，init 只搬权重、从头计数
-（课程也会从 stage 0 重新开始，符合阶段二预期）。
+- temporal 特判：actor 首层输入是 `[current(165) | latent(64)]`，旧 102 列映射到
+  63..165，ball(5) 与 latent(64) 列保持初始化；critic 与更深层走通用规则；
+- **迁移等价性已逐位验证**：把新策略的球+历史通道置零后，actor 输出与旧策略在
+  atol 1e-6 内一致（审查代理独立复现）；
+- **normalizer**：两个 agents cfg 现已显式 `actor/critic_obs_normalization=True`
+  （rsl_rl 3.1.2 的 deprecated `empirical_normalization` 字段因 MISSING→{} 的映射
+  缺口是静默 no-op，曾导致全程无归一化）。旧 stage-1 checkpoint 无 normalizer
+  统计 → 暖启动后统计从零累积（新通道天然单位初始化，无"裸奔冻结"问题）；
+- 新增列保持**随机初始化**（非零）：初始行为 = 旧策略 + 有界扰动，属 net2net
+  常规做法。
 
 ---
 
 ## 6. 方位角课程（`kick_env_cfg.py` · `CurriculumCfg`）
 
 ```python
-widen_target_azimuth(stages = ((0, 0.0), (2000, 0.2618), (6000, 0.7854)))
+widen_target_azimuth(steps_per_iteration=24, stages = ((0, 0.0), (2000, 0.2618), (6000, 0.7854)))
+# iteration = common_step_counter // num_steps_per_env(24) —— 以 PPO 迭代为单位
+# （曾以 max_episode_length(300) 为单位，45° 档需 180 万步 > 预算 72 万步，永不开启）
 ```
 
 | iteration | 方位角半宽 | 意图 |
 |---|---|---|
 | 0 | 0 rad | 靶点永远正前方：先学会"稳定踢中直线" |
 | 2000 | 15° | 小幅变化：球通道开始有辨识度 |
-| 6000 | 45° | 盲踢天花板 15/45≈33%，视觉收益必须显现 |
+| 6000 | 45° | 盲踢天花板 15/45≈33%，视觉收益必须显现（预算 20% 处开启） |
 
 课程在运行期按名字寻址改写 `command.cfg.target_azimuth_range`（等价于文档 3.6 的
 `modify_env_param` 机制）。**注意**：重命名 command 或奖励项而不同步课程地址，只会在
@@ -234,7 +258,7 @@ rollout 时暴露——纯静态检查发现不了。
 
 | 文件 | 上游 | 本任务 |
 |---|---|---|
-| `kick_env_cfg.py` | `tracking_env_cfg.py` | 场景+球；观测插 `ball_state_virtual`+`ball_history`(+critic 球真值)；奖励 9→13 项分 3 组；事件+球随机化；课程非空 |
+| `kick_env_cfg.py` | `tracking_env_cfg.py` | 场景+球；观测插 `ball_state_virtual`+`ball_history`(+critic 球真值)；奖励 9→15 项分 3 组（GOAL 6 项）；事件+球随机化；课程非空 |
 | `mdp/commands.py` | `MotionCommand` | 追加 `KickMotionCommand` 子类（球 spawn/靶点/进度/虚拟感知/历史环/停滞检测）与 `KickMotionCommandCfg` |
 | `mdp/observations.py` | 7 项 | 追加 `ball_state_b` / `ball_velocity_b`（critic 真值）与 `ball_state_virtual_b` / `ball_history_b`（actor 感知版） |
 | `mdp/rewards.py` | 6+3 项 | 追加 GOAL 组 4 项（progress / contact / speed / stagnation） |
@@ -331,8 +355,8 @@ critic 及更深层走通用规则。
    深度、坐标变换与时延建模（可先加里程计漂移噪声：yaw σ≈0.6°/s）；
 2. **real/blind 置换评估未实现**（文档 5.1）：训练稳定后应在 eval 脚本里做跨环境
    置换 + Wilson 95% CI 判定，避免用绝对命中率自欺；
-3. normalizer 从零重估（§5 实测 rsl_rl 3.1.2 的 state_dict 不含 normalizer），
-   迁移初期统计量未成熟时若训练不稳，可考虑先冻结 normalizer 若干迭代；
+3. temporal 的 aux optimizer（encoder/decoder 的 Adam 动量）不入 checkpoint，
+   `--resume` 后从零重启，decoder loss 有一次瞬态抬升；
 4. `foot_ball_contact` 用几何接近判定而非接触力；若出现"路过计费"异常，改用
    `ball_contact_forces` 传感器（场景里球已开 `activate_contact_sensors`）；
 5. 没有加 AMP / 时序观测 / 粗糙地形（文档第一层改造）——本任务聚焦第二层；
@@ -340,27 +364,28 @@ critic 及更深层走通用规则。
 
 ---
 
-## 9. 复现命令速查
+## 10. 复现命令速查
 
 ```bash
-# 阶段一：盲踢先验（无球）
+# 阶段一：盲踢先验（无球，完整动作）
 python scripts/rsl_rl/train.py --task Tracking-Flat-G1-v0 \
   --motion_file motions/kick_football/right_kick.npz \
   --num_envs 2048 --headless --run_name blind_kick_tracking
 
-# 阶段二：视觉踢球（MOTION 退火 0.2，GOAL 打开）
-KICK_MOTION_WEIGHT=0.2 KICK_GOAL_WEIGHT=1.0 \
+# 阶段二：视觉踢球（裁减动作 + 满权重起步，后续按里程碑退火）
+KICK_MOTION_WEIGHT=1.0 KICK_GOAL_WEIGHT=1.0 \
 python scripts/rsl_rl/train.py --task Tracking-KickFootball-Flat-G1-v0 \
-  --motion_file motions/kick_football/right_kick.npz \
+  --motion_file motions/kick_football/right_kick_trimmed.npz \
   --num_envs 2048 --headless \
-  --init_policy_path logs/rsl_rl/g1_flat/<run>/model_XXXX.pt \
+  --init_policy_path logs/rsl_rl/g1_flat/<run>/model_6000.pt \
   --run_name kick_vision
 
 # 后期继续压：resume 时同样带上环境变量
 KICK_MOTION_WEIGHT=0.0 KICK_GOAL_WEIGHT=1.0 \
 python scripts/rsl_rl/train.py --task Tracking-KickFootball-Flat-G1-v0 ... --resume True ...
 
-# 播放
+# 播放（--load_run 给目录名，--checkpoint 只给文件名）
 python scripts/rsl_rl/play.py --task Tracking-KickFootball-Flat-G1-v0 \
-  --motion_file motions/kick_football/right_kick.npz --num_envs 1
+  --motion_file motions/kick_football/right_kick_trimmed.npz --num_envs 1 \
+  --load_run <run目录名> --checkpoint model_XXXX.pt
 ```

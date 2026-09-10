@@ -28,4 +28,12 @@ class G1KickFlatEnvCfg(KickEnvCfg):
             "right_elbow_link",
             "right_wrist_yaw_link",
         ]
-        self.commands.motion.kick_step = 265  # reference ball-contact frame of right_kick.npz
+        # trimmed clip right_kick_trimmed.npz = right_kick.npz[170:510]:
+        # reference ball-contact frame 265 -> 265 - 170 = 95
+        self.commands.motion.kick_step = 95
+        # default motion so the registered entry works without --motion_file
+        # (train.py overrides this from CLI when provided)
+        self.commands.motion.motion_file = "motions/kick_football/right_kick_trimmed.npz"
+        # shorter episodes concentrate on approach + kick (motion is 6.8 s; 6.0 s
+        # avoids the mid-episode motion-loop resample for late-starting envs)
+        self.episode_length_s = 6.0

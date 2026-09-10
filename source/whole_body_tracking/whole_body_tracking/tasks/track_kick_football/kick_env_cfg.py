@@ -302,16 +302,30 @@ class RewardsCfg:
     )
 
     # --- GOAL group: ball / kick target ---
-    ball_target_progress = RewTerm(func=mdp.ball_target_progress, weight=4.0, params={"command_name": "motion"})
+    # Magnitudes are per-episode budgeted (dt = 0.02 s): progress 50 -> 1.0/m
+    # (2.5 full), alignment one-shot 10 (aim: raised from 2.5 after the aim
+    # signal proved too weak to move the policy), approach 10 -> 0.2/m shaping,
+    # contact 10 -> 0.6 total, speed band <= 0.5 auxiliary.
+    ball_target_progress = RewTerm(func=mdp.ball_target_progress, weight=50.0, params={"command_name": "motion"})
     foot_ball_contact = RewTerm(
         func=mdp.foot_ball_contact,
-        weight=1.0,
+        weight=10.0,
         params={"command_name": "motion", "contact_dist": 0.22, "paid_steps": 3, "window_steps": 100},
+    )
+    ball_kick_alignment = RewTerm(
+        func=mdp.ball_kick_alignment,
+        weight=10.0,
+        params={"command_name": "motion"},
     )
     ball_speed = RewTerm(
         func=mdp.ball_speed,
-        weight=0.2,
-        params={"command_name": "motion", "threshold": 2.5},
+        weight=0.5,
+        params={"command_name": "motion", "ramp_threshold": 1.0, "target": 4.5, "std": 1.5},
+    )
+    ball_approach = RewTerm(
+        func=mdp.ball_approach,
+        weight=10.0,
+        params={"command_name": "motion"},
     )
     stagnation = RewTerm(func=mdp.stagnation_penalty, weight=-1.0, params={"command_name": "motion"})
 
@@ -349,7 +363,14 @@ class RewardsCfg:
             self.motion_body_ang_vel,
         ]:
             term.weight *= motion_scale
-        for term in [self.ball_target_progress, self.foot_ball_contact, self.ball_speed, self.stagnation]:
+        for term in [
+            self.ball_target_progress,
+            self.foot_ball_contact,
+            self.ball_kick_alignment,
+            self.ball_speed,
+            self.ball_approach,
+            self.stagnation,
+        ]:
             term.weight *= goal_scale
         for term in [self.action_rate_l2, self.joint_limit, self.undesired_contacts]:
             term.weight *= reg_scale
@@ -386,21 +407,99 @@ class TerminationsCfg:
 def widen_target_azimuth(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
-    stages: tuple[tuple[int, float], ...] = ((0, 0.0), (2000, 0.2618), (6000, 0.7854)),
+    steps_per_iteration: int = 24,
+    stages: tuple[tuple[int, float], ...] = ((0, 0.1745), (2000, 0.2618), (6000, 0.7854)),
 ) -> None:
     """Staged widening of the target azimuth half-range (rad) over training.
 
-    Starts aimed straight (0 rad) so the policy first learns a repeatable kick,
-    then widens so the required kick direction changes every episode -- a fixed
-    blind action stops being optimal and the ball channels become identifiable.
+    ``stages`` are in PPO iterations (converted via ``steps_per_iteration``,
+    the runner's num_steps_per_env). The first stage is +/-10 deg, NOT zero: a
+    constant direction stage trains the policy to ignore the direction channel
+    (weights stay at random init with no gradient, and the converged network
+    routes around them) -- after that, reviving the channel through random
+    projections is nearly impossible (doc's "direction is constant" failure,
+    reproduced empirically in v3/v4). Direction must vary from iteration 0;
+    the curriculum only widens the range.
+    """
+    assert all(stages[i][0] < stages[i + 1][0] for i in range(len(stages) - 1)), "stages must ascend"
+    command: KickMotionCommand = env.command_manager.get_term("motion")
+    iteration = env.common_step_counter // steps_per_iteration
+    azimuth = max(azimuth_rad for stage_iteration, azimuth_rad in stages if iteration >= stage_iteration)
+    command.cfg.target_azimuth_range = azimuth
+
+
+def anneal_motion_weight(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    steps_per_iteration: int = 24,
+    ladder: tuple[float, ...] = (1.0, 0.5, 0.2, 0.1, 0.0),
+    motion_terms: tuple[str, ...] = (
+        "motion_global_anchor_pos",
+        "motion_global_anchor_ori",
+        "motion_body_pos",
+        "motion_body_ori",
+        "motion_body_lin_vel",
+        "motion_body_ang_vel",
+    ),
+    accuracy_gate: float = 0.22,
+    speed_gate: float = 3.0,
+    check_interval_iters: int = 100,
+    hold_checks: int = 5,
+    fallback_iters_per_stage: int = 3000,
+) -> None:
+    """Metric-gated annealing of the MOTION reward group -- no manual schedule.
+
+    Steps the MOTION weight down the ``ladder`` when EITHER:
+      * performance gate: mean kick accuracy (alignment kernel EMA) stays above
+        ``accuracy_gate`` AND mean ball max speed above ``speed_gate`` for
+        ``hold_checks`` consecutive evaluations (every ``check_interval_iters``
+        PPO iterations) -- i.e. the policy has squeezed what the current
+        tracking constraint allows; or
+      * safety fallback: ``fallback_iters_per_stage`` iterations spent on the
+        current stage regardless of metrics, so annealing always progresses.
+
+    Downward only (hysteresis): the weight never climbs back. Initial weights
+    are captured on first call and rescaled by the ladder, so this term composes
+    with the KICK_MOTION_WEIGHT env var (which should now be left at 1.0).
     """
     command: KickMotionCommand = env.command_manager.get_term("motion")
-    iteration = env.common_step_counter // env.max_episode_length
-    azimuth = stages[0][1]
-    for stage_iteration, stage_azimuth in stages:
-        if iteration >= stage_iteration:
-            azimuth = stage_azimuth
-    command.cfg.target_azimuth_range = azimuth
+    state = getattr(command, "_anneal_state", None)
+    if state is None:
+        state = command._anneal_state = {
+            "stage": 0,
+            "held": 0,
+            "last_check_iter": -1,
+            "stage_start_iter": None,
+            "base_weights": {name: env.reward_manager.get_term_cfg(name).weight for name in motion_terms},
+        }
+    iteration = env.common_step_counter // steps_per_iteration
+    if iteration < state["last_check_iter"] + check_interval_iters:
+        return
+    state["last_check_iter"] = iteration
+    if state["stage_start_iter"] is None:
+        state["stage_start_iter"] = iteration
+    if state["stage"] >= len(ladder) - 1:
+        return
+
+    accuracy = float(command.metrics["kick_accuracy"].mean())
+    speed = float(command.metrics["ball_max_speed"].mean())
+    if accuracy >= accuracy_gate and speed >= speed_gate:
+        state["held"] += 1
+    else:
+        state["held"] = 0
+    elapsed = iteration - state["stage_start_iter"]
+    if state["held"] >= hold_checks or elapsed >= fallback_iters_per_stage:
+        reason = "metric gate" if state["held"] >= hold_checks else "fallback timer"
+        state["stage"] += 1
+        state["held"] = 0
+        state["stage_start_iter"] = iteration
+        scale = ladder[state["stage"]]
+        for name in motion_terms:
+            env.reward_manager.get_term_cfg(name).weight = state["base_weights"][name] * scale
+        print(
+            f"[CURRICULUM] MOTION weight -> {scale} at iter {iteration} "
+            f"(kick_accuracy={accuracy:.3f}, ball_max_speed={speed:.2f}, trigger: {reason})"
+        )
 
 
 @configclass
@@ -408,6 +507,7 @@ class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
     target_azimuth = CurriculumTerm(func=widen_target_azimuth)
+    motion_anneal = CurriculumTerm(func=anneal_motion_weight)
 
 
 ##

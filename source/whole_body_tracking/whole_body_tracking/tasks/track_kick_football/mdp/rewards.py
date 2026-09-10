@@ -3,8 +3,6 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_error_magnitude
 
 from whole_body_tracking.tasks.track_kick_football.mdp.commands import KickMotionCommand
@@ -74,14 +72,6 @@ def motion_global_body_angular_velocity_error_exp(
     return torch.exp(-error.mean(-1) / std**2)
 
 
-def feet_contact_time(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, threshold: float) -> torch.Tensor:
-    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    first_air = contact_sensor.compute_first_air(env.step_dt, env.physics_dt)[:, sensor_cfg.body_ids]
-    last_contact_time = contact_sensor.data.last_contact_time[:, sensor_cfg.body_ids]
-    reward = torch.sum((last_contact_time < threshold) * first_air, dim=-1)
-    return reward
-
-
 # ---------------------------------------------------------------------------
 # GOAL group: ball / kick-target rewards
 # ---------------------------------------------------------------------------
@@ -120,18 +110,59 @@ def foot_ball_contact(
     return fresh.float()
 
 
-def ball_speed(env: ManagerBasedRLEnv, command_name: str, threshold: float = 2.5) -> torch.Tensor:
-    """Ball speed beyond ``threshold``: the shot must actually move the ball."""
+def ball_speed(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    ramp_threshold: float = 1.0,
+    target: float = 4.5,
+    std: float = 1.5,
+) -> torch.Tensor:
+    """Ball speed shaped into a target band (default 4-5 m/s).
+
+    Below ``ramp_threshold``: 0 (ball untouched). Between threshold and target:
+    linear ramp -- any real kick earns something. Above target: Gaussian decay,
+    so excessive power earns less than a well-paced shot (the reference swing
+    can physically produce 6+ m/s; an unbounded speed reward pushes the policy
+    into wild maximal swings that destroy tracking and stability).
+    """
     command: KickMotionCommand = env.command_manager.get_term(command_name)
-    return (torch.norm(command.ball_vel_w, dim=-1) - threshold).clamp(min=0.0)
+    speed = torch.norm(command.ball_vel_w, dim=-1)
+    ramp = ((speed - ramp_threshold) / (target - ramp_threshold)).clamp(0.0, 1.0)
+    decay = torch.exp(-(((speed - target) / std) ** 2))
+    return torch.where(speed < target, ramp, decay)
 
 
 def stagnation_penalty(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """-1 while the robot barely moved its anchor over the trailing window.
+    """1.0 while the robot barely moved its anchor over the trailing window.
 
     Guards against "stand still / stand next to the ball" reward farming
     (arXiv:2511.03996 uses the same guard). Only active after the window has
-    fully elapsed within the episode.
+    fully elapsed within the episode. Follows the repo convention: penalty
+    functions return a positive magnitude, the term weight is negative.
     """
     command: KickMotionCommand = env.command_manager.get_term(command_name)
-    return -command._stagnant.float()
+    return command._stagnant.float()
+
+
+def ball_kick_alignment(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """One-shot Gaussian kernel on the kick's outgoing direction vs the target.
+
+    The fire event and kernel are computed in the command (which also exposes
+    them as the ``kick_accuracy`` metric that the annealing curriculum gates on);
+    this term just pays them once per episode. A one-shot payment is essential:
+    a per-step kernel rewards slow rolling (more steps above threshold = more
+    reward), which inverts the intended 4-5 m/s speed target.
+    """
+    command: KickMotionCommand = env.command_manager.get_term(command_name)
+    return command._alignment_fire * command._alignment_kernel
+
+
+def ball_approach(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Per-step reduction of the robot-anchor to ball distance (potential-based).
+
+    Keeps the robot walking towards the ball (walking away is penalised). The
+    potential is frozen once the ball is moving, so a successful kick is never
+    taxed for the distance the ball travels away from the robot.
+    """
+    command: KickMotionCommand = env.command_manager.get_term(command_name)
+    return command._approach_delta.clone()

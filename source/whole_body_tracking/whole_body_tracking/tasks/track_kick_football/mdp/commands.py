@@ -416,6 +416,13 @@ class KickMotionCommand(MotionCommand):
         self._progress_delta = torch.zeros(self.num_envs, device=self.device)
         self._contact_paid = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        # robot->ball approach (potential-based reward state, frozen once the ball moves)
+        self._anchor_ball_dist = torch.zeros(self.num_envs, device=self.device)
+        self._approach_delta = torch.zeros(self.num_envs, device=self.device)
+
+        # one-shot kick-alignment event flag (pays on the ball's speed rising edge)
+        self._alignment_paid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
         # -- virtual perception state --------------------------------------
         # latest perceived ball obs [est_pos_b(2), dir_b(2), visible(1)]
         self._perceived_ball = torch.zeros(self.num_envs, 5, device=self.device)
@@ -435,6 +442,12 @@ class KickMotionCommand(MotionCommand):
         self.metrics["ball_max_speed"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["ball_target_dist"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["ball_visible"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["kick_accuracy"] = torch.zeros(self.num_envs, device=self.device)
+
+        # one-shot kick event bookkeeping (reward reads, curriculum gates on it)
+        self._alignment_fire = torch.zeros(self.num_envs, device=self.device)
+        self._alignment_kernel = torch.zeros(self.num_envs, device=self.device)
+        self._kick_accuracy_ema = torch.zeros(self.num_envs, device=self.device)
 
     # -- ball state (world / anchor frame) -----------------------------------
 
@@ -469,13 +482,23 @@ class KickMotionCommand(MotionCommand):
 
     # -- per-episode resampling ----------------------------------------------
 
+    def _adaptive_sampling(self, env_ids: Sequence[int]):
+        """Sample start bins restricted to the beginning of the motion.
+
+        The clamp MUST live here, before ``_resample_command`` writes the robot
+        state from the sampled frame -- clamping afterwards would write the
+        robot at an arbitrary (often post-kick) pose while relabelling time to
+        the clamped frame, leaving the ball (spawned at the fixed world offset)
+        behind the robot for most episodes.
+        """
+        super()._adaptive_sampling(env_ids)
+        max_start = int(self.cfg.start_time_fraction * (self.motion.time_step_total - 1))
+        self.time_steps[env_ids] = torch.clamp(self.time_steps[env_ids], max=max_start)
+
     def _resample_command(self, env_ids: Sequence[int]):
         super()._resample_command(env_ids)
         if len(env_ids) == 0:
             return
-        # keep the reference kick inside every episode: start near the beginning
-        max_start = int(self.cfg.start_time_fraction * (self.motion.time_step_total - 1))
-        self.time_steps[env_ids] = torch.clamp(self.time_steps[env_ids], max=max_start)
         self._spawn_ball_and_target(env_ids)
 
     def _spawn_ball_and_target(self, env_ids: Sequence[int]):
@@ -501,14 +524,19 @@ class KickMotionCommand(MotionCommand):
         self._progress[env_ids] = 0.0
         self._progress_delta[env_ids] = 0.0
         self._contact_paid[env_ids] = 0
+        self._alignment_paid[env_ids] = False
+        self._anchor_ball_dist[env_ids] = torch.norm(
+            ball_pos[:, :2] - self.robot_anchor_pos_w[env_ids, :2], dim=-1
+        )
+        self._approach_delta[env_ids] = 0.0
         self.metrics["ball_max_speed"][env_ids] = 0.0
 
-        # fresh perception immediately at episode start; seed history with it
-        self._perception_countdown[env_ids] = 0
-        self._update_ball_perception()
-        current = self._perceived_ball
-        self._ball_ring[:] = current.unsqueeze(1)
-        self._anchor_xy_ring[:] = self.robot_anchor_pos_w[:, None, :2]
+        # fresh perception immediately at episode start; seed the history ring of
+        # the RESET envs only -- writing [:] would flatten every other env's
+        # history and disable the latency/25 Hz models for them
+        self._update_ball_perception(env_ids)
+        self._ball_ring[env_ids] = self._perceived_ball[env_ids].unsqueeze(1)
+        self._anchor_xy_ring[env_ids] = self.robot_anchor_pos_w[env_ids, None, :2]
 
     # -- per-step update -------------------------------------------------------
 
@@ -522,13 +550,47 @@ class KickMotionCommand(MotionCommand):
         self._progress_delta = progress - self._progress
         self._progress = progress
 
+        # robot->ball approach delta (potential-based, signed). Frozen once the
+        # ball is moving: after a successful kick the ball flying away would
+        # otherwise tax the robot for the distance it created (telescoping to
+        # roughly -target_distance over the episode).
+        ball_moving = torch.norm(self.ball_vel_w[:, :2], dim=-1) > 0.5
+        anchor_ball_dist = torch.norm(self.ball_pos_w[:, :2] - self.robot_anchor_pos_w[:, :2], dim=-1)
+        self._approach_delta = torch.where(
+            ball_moving, torch.zeros_like(anchor_ball_dist), self._anchor_ball_dist - anchor_ball_dist
+        )
+        self._anchor_ball_dist = torch.where(ball_moving, self._anchor_ball_dist, anchor_ball_dist)
+
         # virtual perception + history ring + stagnation
         self._update_ball_perception()
         self._ball_ring[:, self._ring_step % self.BALL_RING_LENGTH] = self._perceived_ball
         self._ring_step += 1
         self._update_stagnation()
 
-    def _update_ball_perception(self):
+        # one-shot kick-alignment event: on the ball-speed rising edge, record the
+        # angle kernel between the outgoing direction and the ball->target direction.
+        # The reward pays it once; the annealing curriculum gates on its EMA.
+        ball_speed_xy = torch.norm(self.ball_vel_w[:, :2], dim=-1)
+        fire = (ball_speed_xy > 1.0) & ~self._alignment_paid
+        self._alignment_paid |= fire
+        self._alignment_fire = fire.float()
+        self._alignment_kernel = torch.zeros_like(self._alignment_fire)
+        if torch.any(fire):
+            rows = fire.nonzero(as_tuple=False).flatten()
+            vel_xy = self.ball_vel_w[rows, :2]
+            outgoing = torch.nn.functional.normalize(vel_xy, dim=-1, eps=1e-6)
+            to_target = self.target_pos_w[rows, :2] - self.ball_pos_w[rows, :2]
+            to_target = torch.nn.functional.normalize(to_target, dim=-1, eps=1e-6)
+            cos = torch.sum(outgoing * to_target, dim=-1).clamp(-1.0, 1.0)
+            kernel = torch.exp(-((torch.acos(cos) / self.cfg.alignment_std) ** 2))
+            self._alignment_kernel[rows] = kernel
+            ema_alpha = 0.02
+            self._kick_accuracy_ema[rows] = (
+                ema_alpha * kernel + (1 - ema_alpha) * self._kick_accuracy_ema[rows]
+            )
+        self.metrics["kick_accuracy"][:] = self._kick_accuracy_ema
+
+    def _update_ball_perception(self, refresh_ids: torch.Tensor | None = None):
         """Advance the virtual perception of the ball (actor-side observation).
 
         Models four characteristics of onboard vision measured in
@@ -536,9 +598,17 @@ class KickMotionCommand(MotionCommand):
         noise, reduced update frequency (~25 Hz vs 50 Hz control), and latency.
         Between perception refreshes the last estimate is held; on a miss the
         position is zeroed and the visibility flag drops to 0.
+
+        Called every control step without arguments (advance the perception
+        clock for all envs), or with explicit ``refresh_ids`` at episode reset
+        to force a fresh perception for just those envs without touching the
+        countdowns of the others.
         """
-        self._perception_countdown -= 1
-        fresh_ids = (self._perception_countdown <= 0).nonzero(as_tuple=False).flatten()
+        if refresh_ids is None:
+            self._perception_countdown -= 1
+            fresh_ids = (self._perception_countdown <= 0).nonzero(as_tuple=False).flatten()
+        else:
+            fresh_ids = refresh_ids
         if fresh_ids.numel() == 0:
             return
         n = fresh_ids.numel()
@@ -642,6 +712,9 @@ class KickMotionCommandCfg(MotionCommandCfg):
 
     # reference time step of ball contact (for time-gating the contact reward)
     kick_step: int = 265
+
+    # std (rad) of the one-shot kick-alignment angle kernel (~15 deg)
+    alignment_std: float = 0.2618
 
     # -- virtual perception (arXiv:2511.03996 appendix, measured on a real robot) --
     ball_detection_prob: float = 0.9          # P(detect) per perception refresh
